@@ -51,8 +51,8 @@ const DEDUPE_MS = 800 // 同じボタンの focus と press が続けて届い�
 // 導入後に 1 回出す案内。[?] ボタンでいつでも出せる
 const GUIDE = [
   '🌊 海 (sea): 入力欄の上に海が出ています',
-  '  入力欄の上の操作行: [音 ON] 音の切り替え / [-] [+] 音量 / [場面] 朝→昼→夕焼け→夜→明け方→自動 / [?] この案内',
-  '  コマンド: /sea help (一覧) /sea (このセッションの表示を隠す・出す) /sea sound off (音を止める)',
+  '  入力欄の上の操作行: [⏻ ON] 電源 (全セッションの海と音を止める/戻す) / [音 ON] 音の切り替え / [-] [+] 音量 / [場面] 場面を切り替え / [?] この案内',
+  '  コマンド: /sea help (一覧) / /sea (電源を切る・入れる。全セッション共通) / /sea sound off (音だけ止める)',
 ].join('\n')
 
 // /sea help の本文
@@ -60,10 +60,14 @@ const HELP = [
   '海 (sea) の操作',
   '',
   '入力欄の上の操作行 (クリック)',
-  '  [音 ON] 音の ON/OFF   [-] [+] 音量   [場面:...] 場面を順に切り替え   [?] 案内を出す',
+  '  [⏻ ON] 電源 (全セッションの海と音を止める/戻す)   [音 ON] 音の ON/OFF',
+  '  [-] [+] 音量   [場面:...] 場面を順に切り替え   [?] 案内を出す',
+  '  電源を切ると、入力欄の上に [⏻ OFF] の 1 行だけが残ります。押すと全セッションで戻ります',
+  '  その行の [×] で、行ごと閉じられます (全セッション共通。/sea で電源を入れ直せます)',
   '',
   'コマンド',
-  '  /sea                 このセッションの海を隠す/出す (全セッションで隠すと音も止まる)',
+  '  /sea                 電源を切る/入れる (全セッションの海と音が一斉に止まる/戻る)',
+  '  /sea on | off        電源を入れる/切る',
   '  /sea status          表示・音・プレーヤー・セッション数・直近のログを見る',
   '  /sea help            この一覧',
   '',
@@ -88,9 +92,11 @@ const HELP = [
 // ---- 全セッション共通の制御 ----
 // 場面の固定・呼び出した動くもの・音の ON/OFF/音量/ずれ補正は、1 つの制御ファイルで管理する。
 // どのセッションで操作しても、開いている全セッションの表示と音に反映される。
-// (波・潮位・場面の巡りは時計から決まるので、もともと全セッションで同じ。表示の ON/OFF だけセッションごと)
-type Control = { on: boolean; volume: number; syncMs: number; scene: number; forced: ForcedActor | null; rev: number }
-const DEFAULT_CONTROL: Control = { on: true, volume: 30, syncMs: 120, scene: -1, forced: null, rev: 0 }
+// 電源 (power) も同じ: 切ると全セッションの海が隠れて音も止まり、入れると全セッションに出て音も戻る。
+// (波・潮位・場面の巡りは時計から決まるので、もともと全セッションで同じ)
+// on = 波の音の ON/OFF、power = 海そのもの (絵と音) の電源、closed = 電源を切ったあとに残る 1 行を [×] で閉じたか
+type Control = { on: boolean; power: boolean; closed: boolean; volume: number; syncMs: number; scene: number; forced: ForcedActor | null; rev: number }
+const DEFAULT_CONTROL: Control = { on: true, power: true, closed: false, volume: 30, syncMs: 120, scene: -1, forced: null, rev: 0 }
 
 // 音を出せない環境 (Windows 以外など) で、起動を何度も試して通知を連発しないための印
 let soundBroken = false
@@ -151,32 +157,13 @@ async function playerAgeMs($: EngineInterface, dir: string, now: number): Promis
   }
 }
 
-// 生きているセッションの数と、そのうち海を表示しているセッションの数。
-// 各セッションは合図のファイルに、海を隠しているあいだ "hidden" と書く (音のプレーヤーが読む)
-async function countSessions($: EngineInterface, dir: string, now: number): Promise<{ alive: number; shown: number }> {
-  let alive = 0
-  let shown = 0
+async function countSessions($: EngineInterface, dir: string, now: number): Promise<number> {
   try {
     const entries = await $.fs.list(`${dir}/sessions`)
-    for (const f of entries) {
-      if (f.kind !== 'file' || now - f.mtimeMs >= SESSION_FRESH_MS) continue
-      alive += 1
-      try {
-        if (!String(await $.fs.read(`${dir}/sessions/${f.name}`)).includes('hidden')) shown += 1
-      } catch {
-        shown += 1
-      }
-    }
+    return entries.filter(f => f.kind === 'file' && now - f.mtimeMs < SESSION_FRESH_MS).length
   } catch {
-    // 数えられなければ 0
+    return 0
   }
-  return { alive, shown }
-}
-
-// このセッションの生きている合図。海を隠しているあいだは "hidden" を添える。
-// 全セッションが隠しているときだけ、音のプレーヤーは音を止める
-async function writeBeat($: EngineInterface, dir: string, sid: string, now: number, hidden: boolean) {
-  await $.fs.write(`${dir}/sessions/${sid}.txt`, hidden ? `${now} hidden` : String(now))
 }
 
 // プレーヤーが書いたログの末尾 (音が鳴らないときの手がかり)
@@ -221,8 +208,10 @@ async function launchPlayer($: EngineInterface, dir: string): Promise<boolean> {
 // ボタンの押下は ui.press フックで受ける (onPress 自体は何もしない)
 function noop() {}
 
-type ControlKind = 'sound' | 'vol-' | 'vol+' | 'scene'
+type ControlKind = 'power' | 'close' | 'sound' | 'vol-' | 'vol+' | 'scene'
 const CONTROL_KEYS: Record<string, ControlKind | 'help'> = {
+  'sea-power': 'power',
+  'sea-close': 'close',
   'sea-sound': 'sound',
   'sea-vol-down': 'vol-',
   'sea-vol-up': 'vol+',
@@ -233,6 +222,8 @@ const CONTROL_KEYS: Record<string, ControlKind | 'help'> = {
 // ボタンに応じて制御ファイルを書き換える。読めなければ undefined (書かない)
 async function pressControl($: EngineInterface, dir: string, kind: ControlKind): Promise<Control | undefined> {
   const cur = (await readControl($, dir)) ?? DEFAULT_CONTROL
+  if (kind === 'power') return writeControl($, dir, { power: !cur.power, closed: false }) // 切るたびに、1 行は出し直す
+  if (kind === 'close') return writeControl($, dir, { closed: true })
   if (kind === 'sound') return writeControl($, dir, { on: !cur.on })
   if (kind === 'vol-') return writeControl($, dir, { volume: Math.max(VOLUME_STEP, cur.volume - VOLUME_STEP) })
   if (kind === 'vol+') return writeControl($, dir, { on: true, volume: Math.min(100, cur.volume + VOLUME_STEP) })
@@ -257,12 +248,18 @@ async function actOnControl($: EngineInterface, dir: string, element: string, ga
     $.ui.log(GUIDE, { to: 'transcript' })
     return undefined
   }
-  if (now < gate.busyUntil) return undefined // 準備中
+  if (now < gate.busyUntil && kind !== 'power' && kind !== 'close') return undefined // 準備中 (電源と閉じるは、いつでも押せる)
   const before = await readControl($, dir)
   const ctl = await pressControl($, dir, kind)
   if (!ctl) {
     $.ui.toast('海: 制御ファイルを読めませんでした (ほかのセッションが書き込み中かもしれません)。もう一度押してください')
     return undefined
+  }
+  if (kind === 'power' || kind === 'close') {
+    gate.busyUntil = 0 // 電源の切り替えは待たせない (音は、止める/戻すだけで、作り直さない)
+    if (kind === 'close') $.ui.toast('海を閉じました。/sea で電源を入れ直せます', { timeoutMs: 6000 })
+    $.ui.invalidate('ui.render')
+    return ctl
   }
   // 受け付けない時間: 止めたあとはプレーヤーが終わるまで / 止まっていた音を鳴らすならプレーヤーの起動まで /
   // 場面の切り替えは音の合成し直しのあいだ。音量だけの変更は掛け直すだけなので待たない
@@ -281,8 +278,10 @@ function controlRow(El: Els, soundOn: boolean, volume: number, scene: number, bu
   const { Box, Text, Button } = El
   const sceneName = scene >= 0 ? SCENES[scene].label.replace('の海', '') : '自動'
   if (busy) {
+    // 準備中でも電源は押せる
     return (
       <Box flexDirection="row" gap={1}>
+        <Button key="sea-power" plain label="[⏻ ON]" onPress={noop} />
         <Text bold>{soundOn ? '音 準備中…' : '音 停止中…'}</Text>
         <Text bold>{`音量 ${volume}`}</Text>
         <Text bold>{`場面:${sceneName}`}</Text>
@@ -291,6 +290,7 @@ function controlRow(El: Els, soundOn: boolean, volume: number, scene: number, bu
   }
   return (
     <Box flexDirection="row" gap={1}>
+      <Button key="sea-power" plain label="[⏻ ON]" onPress={noop} />
       <Button key="sea-sound" plain label={soundOn ? '[音 ON]' : '[音 OFF]'} onPress={noop} />
       <Button key="sea-vol-down" plain label="[-]" onPress={noop} />
       <Text bold>{`音量 ${volume}`}</Text>
@@ -301,13 +301,26 @@ function controlRow(El: Els, soundOn: boolean, volume: number, scene: number, bu
   )
 }
 
+// 電源が切れているあいだ、入力欄の上に残す 1 行。押すと全セッションの海と音が戻る
+function powerOffRow(El: Els) {
+  const { Box, Text, Button } = El
+  return (
+    <Box flexDirection="row" gap={1}>
+      <Button key="sea-power" plain label="[⏻ OFF]" onPress={noop} />
+      <Text bold>海は停止中です。押すと全セッションに海と音が戻ります (/sea でも戻せます)</Text>
+      <Button key="sea-close" plain role="dismiss" label="[×]" onPress={noop} />
+    </Box>
+  )
+}
+
 export const register: Register = on => {
   let dir = '' // 状態の置き場 (session.start で決まる)
   let sid = '' // このセッションの印 (合図のファイル名)
   const gate: ControlGate = { busyUntil: 0, lastEl: '', lastAt: 0 } // 操作行の受付状態
   let soundOn = true // 制御ファイルの音 ON/OFF (操作行の表示用)
   let volume = DEFAULT_CONTROL.volume // 同・音量
-  let isOn = true // /sea で切り替える (セッションごと)
+  let isOn = true // 海の電源。制御ファイルの power (全セッション共通)
+  let barClosed = false // 電源が切れているときに残す 1 行を閉じたか。制御ファイルの closed (全セッション共通)
   let rows = ROWS // 直近に描いた高さ
   let label = ''
   let pinned: number | undefined // 制御ファイルの scene。undefined = 時間経過で自動ループ
@@ -321,7 +334,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'sea',
-      description: '入力欄の上の海を表示/非表示。/sea help でコマンド一覧',
+      description: '入力欄の上の海の電源 (全セッション共通)。/sea help でコマンド一覧',
     })
     await $.ui.close({ id: PANE }) // 旧パネルの掃除
 
@@ -364,12 +377,20 @@ export const register: Register = on => {
           forced = ctl.forced ?? undefined
           soundOn = ctl.on
           volume = ctl.volume
+          if (ctl.power !== isOn || ctl.closed !== barClosed) {
+            // 電源か [×] が、どこかのセッションで切り替えられた: 海を出す/隠す/閉じるを揃える
+            isOn = ctl.power
+            barClosed = ctl.closed
+            label = ''
+            if (isOn) ticks = 0 // 戻ったら、すぐ生存の合図とプレーヤーの確認を行う
+            $.ui.invalidate('ui.render')
+          }
         }
         ticks += 1
         if (ticks % BEAT_EVERY !== 1) return
         const now = await $.clock.now()
-        await writeBeat($, dir, sid, now, !isOn)
-        if (ctl?.on !== false && !soundBroken && now - lastSpawn > SPAWN_COOLDOWN_MS && (await playerAgeMs($, dir, now)) > PLAYER_STALE_MS) {
+        await $.fs.write(`${dir}/sessions/${sid}.txt`, String(now))
+        if (ctl?.on !== false && ctl?.power !== false && !soundBroken && now - lastSpawn > SPAWN_COOLDOWN_MS && (await playerAgeMs($, dir, now)) > PLAYER_STALE_MS) {
           // 起動してもすぐ止まる (音声の再生コマンドが無いなど) 状態が続いたら、あきらめて 1 回だけ知らせる
           quickRetries = now - lastSpawn < 90000 ? quickRetries + 1 : 0
           lastSpawn = now
@@ -430,13 +451,12 @@ export const register: Register = on => {
       const ctl = (await readControl($, dir)) ?? DEFAULT_CONTROL
       const age = await playerAgeMs($, dir, now)
       const sessions = await countSessions($, dir, now)
-      const muted = ctl.on && sessions.alive > 0 && sessions.shown === 0
       const tail = age >= PLAYER_STALE_MS ? await tailLog($, dir, 3) : ''
       const lines = [
-        `表示: ${isOn ? 'ON' : 'OFF'} (このセッション) / 場面: ${ctl.scene >= 0 ? SCENES[ctl.scene].label : '自動で巡る'}`,
+        `電源: ${ctl.power ? 'ON' : ctl.closed ? 'OFF (海も音も停止中・1 行も閉じ済み)' : 'OFF (海も音も停止中)'} (全セッション共通) / 場面: ${ctl.scene >= 0 ? SCENES[ctl.scene].label : '自動で巡る'}`,
         `音: ${ctl.on ? 'ON' : 'OFF'} / 音量 ${ctl.volume} / ずれ補正 ${ctl.syncMs}ms`,
         `プレーヤー: ${age < PLAYER_STALE_MS ? `稼働中 (合図 ${(age / 1000).toFixed(1)} 秒前)` : '停止'}${soundBroken ? ' / 起動に失敗した印あり' : ''}`,
-        `生きているセッション: ${sessions.alive} (うち海を表示中: ${sessions.shown})${muted ? ' / 全セッションで隠しているため、音は一時停止中' : ''}`,
+        `生きているセッション: ${sessions}`,
         `状態の置き場: ${dir}`,
         ...(tail ? [`直近のプレーヤーのログ:\n${tail}`] : []),
       ]
@@ -470,27 +490,26 @@ export const register: Register = on => {
       if (!(await writeControl($, dir, { on: soundOn, volume }))) return BUSY
       return { text: soundOn ? `波の音 (全セッション共通): ON (音量 ${volume})。数秒後に鳴り始めます。` : '波の音 (全セッション共通): OFF' }
     }
-    if (arg !== '') {
+    if (arg !== '' && arg !== 'on' && arg !== 'off') {
       return {
         text: '海: 使い方が違います。/sea help でコマンド一覧を見られます。',
       }
     }
 
-    // 引数なし: このセッションの表示だけを切り替える (音は全セッション共通なので止めない)
-    isOn = !isOn
+    // 引数なし: 電源を切り替える。全セッションの海と音が一斉に止まる/戻る。on / off で指定もできる
+    const cur = (await readControl($, dir)) ?? DEFAULT_CONTROL
+    const power = arg === 'on' ? true : arg === 'off' ? false : !cur.power
+    const next = await writeControl($, dir, { power, closed: false })
+    if (!next) return BUSY
+    if (next.on && next.power) soundBroken = false
+    isOn = next.power
+    barClosed = false
+    label = ''
     $.ui.invalidate('ui.render')
-    if (!isOn) $.ui.status(undefined)
-    if (sid) {
-      try {
-        await writeBeat($, dir, sid, await $.clock.now(), !isOn) // すぐ知らせる (全セッションが隠したら音が止まる)
-      } catch {
-        // 次の周期の合図で伝わる
-      }
-    }
     return {
       text: isOn
-        ? '海を表示します。'
-        : '海を隠しました (このセッションだけ)。開いているすべてのセッションで隠すと、波の音も止まります。/sea でまた見られます。',
+        ? '海の電源を入れました (全セッションに海が出て、音も戻ります)。'
+        : '海の電源を切りました (全セッションの海を隠し、音も止めます)。/sea または 入力欄の上の [⏻ OFF] で戻せます ([×] で 1 行ごと閉じることもできます)。',
     }
   })
 
@@ -501,18 +520,23 @@ export const register: Register = on => {
     pinned = ctl.scene >= 0 ? ctl.scene : undefined
     soundOn = ctl.on
     volume = ctl.volume
+    if (ctl.power !== isOn || ctl.closed !== barClosed) {
+      isOn = ctl.power
+      barClosed = ctl.closed
+      label = ''
+    }
   }
 
   // 海は表示専用。クリックされても入力欄からキーを奪わない (奪われると、Esc を押すまで入力できず固まって見える)。
   // 操作行のボタンはクリックが ui.focus として届くので、ここで操作を実行してから focus を拒否する
+  // (電源が切れているあいだに残す [⏻ OFF] も同じ)
   on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!isOn) return next(e)
     if (e.element !== undefined && e.element in CONTROL_KEYS) {
       if (dir === '') dir = await stateDirOf($)
       takeControl(await actOnControl($, dir, e.element, gate))
       return { deny: '海は表示専用です' }
     }
-    if (e.element === undefined) return { deny: '海は表示専用です' }
+    if (isOn && e.element === undefined) return { deny: '海は表示専用です' }
     return next(e)
   })
 
@@ -526,7 +550,18 @@ export const register: Register = on => {
 
   // 入力欄の真上のバンド
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!isOn || e.props.hasSurvey || e.props.maxRows < 4) return next(e)
+    if (e.props.hasSurvey) return next(e)
+
+    // 電源が切れているあいだは、戻すための 1 行だけを残す
+    if (!isOn) {
+      if (label !== 'off') {
+        label = 'off'
+        $.ui.status('🌊 停止中')
+      }
+      if (barClosed) return next(e) // [×] で閉じた: 何も出さない (/sea で戻る)
+      return powerOffRow($.ui.resolve(e))
+    }
+    if (e.props.maxRows < 4) return next(e)
 
     // 操作行 (1 行) を絵の下に付ける。高さか幅が足りなければ絵だけ
     const showControls = e.props.maxRows >= 5 && e.props.bodyColumns >= CONTROLS_MIN_COLS

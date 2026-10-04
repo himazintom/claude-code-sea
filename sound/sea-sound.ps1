@@ -324,23 +324,10 @@ function Read-Control {
   }
   return $null
 }
-# 'none' = no live session, 'hidden' = live sessions exist but every one has hidden the sea (/sea), 'shown' = at least one shows it.
-# A session writes the word "hidden" into its heartbeat file while its sea is hidden.
-function Get-SessionState {
+function Test-SessionAlive {
   $cut = (Get-Date).AddSeconds(-30)
-  $alive = 0
-  $shown = 0
-  foreach ($f in (Get-ChildItem -Path $sessionsDir -File -ErrorAction SilentlyContinue)) {
-    if ($f.LastWriteTime -gt $cut) {
-      $alive++
-      $t = ''
-      try { $t = [System.IO.File]::ReadAllText($f.FullName) } catch { }
-      if ($t -notmatch 'hidden') { $shown++ }
-    }
-  }
-  if ($alive -eq 0) { return 'none' }
-  if ($shown -eq 0) { return 'hidden' }
-  return 'shown'
+  $any = Get-ChildItem -Path $sessionsDir -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $cut } | Select-Object -First 1
+  return ($null -ne $any)
 }
 
 Write-Log 'start'
@@ -357,7 +344,6 @@ $baseStartMs = [int64]0  # the moment (ms) sample 0 of $baseBytes plays, as if t
 $playVol = -1.0        # the volume the player is playing now
 $marginMs = 3000       # how far ahead to plan the start of a new synthesis; follows how long the last one took
 $idle = 0
-$sessState = 'shown'
 $slowN = 0
 $tickN = 0
 
@@ -390,8 +376,7 @@ while ($true) {
   if ($null -ne $ctl -and $ctl.on -eq $false) { Write-Log 'exit: turned off'; break }       # turned off from any session
   if ($slow) {
     if ((Get-Item $scriptPath).LastWriteTimeUtc.Ticks -ne $scriptStamp) { Write-Log 'exit: script updated'; break }   # updated: a fresh player takes over
-    $sessState = Get-SessionState
-    if ($sessState -eq 'none') { $idle++ } else { $idle = 0 }
+    if (Test-SessionAlive) { $idle = 0 } else { $idle++ }
     if ($idle -ge 3) { Write-Log 'exit: no live session'; break }  # every session is closed
     $slowN++
     if ($idle -eq 0 -and ($slowN % 60) -eq 0) {                   # tidy up heartbeat files of sessions long gone
@@ -399,12 +384,12 @@ while ($true) {
     }
   }
   if ($idle -gt 0) { Start-Sleep -Milliseconds 330; continue }   # no session yet: do not start playing
-  if ($sessState -eq 'hidden') {
-    # every session hides the sea: stay quiet; when one shows it again, playback resumes at the right phase
+  if ($null -ne $ctl -and $ctl.power -eq $false) {
+    # the sea is switched off (power, shared by every session): stay quiet; when it is switched on, playback resumes at the right phase
     if ($null -ne $player) {
       $player.Stop(); $player.Dispose(); $player = $null
       $playVol = -1.0
-      Write-Log 'muted: every session hides the sea'
+      Write-Log 'muted: power off'
     }
     Start-Sleep -Milliseconds 330; continue
   }

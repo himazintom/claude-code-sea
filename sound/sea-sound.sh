@@ -118,9 +118,11 @@ while :; do
   if [ -n "$(find "$SESS" -type f -mmin -1 2>/dev/null | head -n 1)" ]; then idle=0; else idle=$(( idle + 1 )); fi
   if [ "$idle" -ge 3 ]; then log "exit: no live session"; break; fi
   if [ "$idle" -gt 0 ]; then sleep 1; continue; fi
-  # every live session has hidden the sea (/sea): stay quiet, and start again at the right phase when one shows it again
-  if [ -z "$(find "$SESS" -type f -mmin -1 ! -exec grep -q hidden {} \; -print 2>/dev/null | head -n 1)" ]; then
-    if [ -n "$LOOP_PID" ]; then stop_play; sig=""; log "muted: every session hides the sea"; fi
+  # the sea is switched off (power, shared by every session): stay quiet, and start again at the right phase when it is switched on
+  power=$(field power)
+  [ -n "$power" ] && last_power="$power"
+  if [ "${last_power:-true}" = "false" ]; then
+    if [ -n "$LOOP_PID" ]; then stop_play; sig=""; log "muted: power off"; fi
     sleep 1; continue
   fi
 
