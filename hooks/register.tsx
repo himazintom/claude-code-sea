@@ -40,6 +40,32 @@ const NAMES: Record<string, number> = {
   dawn: 4,
 }
 
+// /sea help の本文
+const HELP = [
+  '海 (sea) のコマンド',
+  '',
+  '  /sea                 このセッションの表示を切り替える (音は止まりません)',
+  '  /sea status          表示・音・プレーヤー・セッション数・直近のログを見る',
+  '  /sea help            この一覧',
+  '',
+  '場面 (全セッション共通)',
+  '  /sea morning | noon | dusk | night | dawn',
+  '                       朝 / エメラルド / 夕焼け / 真夜中 / 明け方に固定する',
+  '  /sea auto            時間とともに自動で巡らせる',
+  '',
+  '動くものを今すぐ呼ぶ (全セッションに出ます)',
+  '  /sea crab | swept | turtle | fish | gull | meteor | boat | shell',
+  '                       crab: Claude くん / swept: 波にさらわれる Claude くん',
+  '                       turtle: ウミガメ / fish: 魚の群れ / gull: カモメの影',
+  '                       meteor: 流れ星 (夜) / boat: 小舟 / shell: 貝殻とヒトデ',
+  '',
+  '波の音 (全セッション共通)',
+  '  /sea sound           ON / OFF を切り替える',
+  '  /sea sound on | off | 0-100',
+  '                       ON / OFF / 音量 (0 は OFF)',
+  '  /sea sync <ms>       音を画面の波より遅らせる量。音が先走るなら大きく (既定 120)',
+].join('\n')
+
 // ---- 全セッション共通の制御 ----
 // 場面の固定・呼び出した動くもの・音の ON/OFF/音量/ずれ補正は、1 つの制御ファイルで管理する。
 // どのセッションで操作しても、開いている全セッションの表示と音に反映される。
@@ -115,11 +141,31 @@ async function countSessions($: EngineInterface, dir: string, now: number): Prom
   }
 }
 
-// 音のプレーヤー (sound/sea-sound.ps1) を、どのセッションにも属さない常駐プロセスとして起動する。
-// セッションを閉じても止まらず、全セッションが閉じて 30 秒たつか、/sea sound off で自分で終わる。
-// 複数のセッションが同時に起動を試みても、プレーヤー側の Mutex で 1 つしか動かない。
+// プレーヤーが書いたログの末尾 (音が鳴らないときの手がかり)
+async function tailLog($: EngineInterface, dir: string, n: number): Promise<string> {
+  try {
+    const text = (await $.fs.read(`${dir}/player.log`)) as string
+    return text.trim().split('\n').slice(-n).map(l => `  ${l}`).join('\n')
+  } catch {
+    return ''
+  }
+}
+
+// 音のプレーヤーを、どのセッションにも属さない常駐プロセスとして起動する。
+//   Windows: sound/sea-sound.ps1 (PowerShell が波音を合成して再生する)
+//   macOS / Linux: sound/sea-sound.sh (事前に書き出した波音のループを、OS の再生コマンドで鳴らす)
+// セッションを閉じても止まらず、全セッションが閉じてしばらくたつか、/sea sound off で自分で終わる。
+// 複数のセッションが同時に起動を試みても、プレーヤー側の排他 (Mutex / ロック) で 1 つしか動かない。
 // 音量・場面・ずれ補正は、プレーヤーが制御ファイルを見て自分で追従する
 async function launchPlayer($: EngineInterface, dir: string): Promise<boolean> {
+  if ((await $.env.get('OS')) !== 'Windows_NT') {
+    try {
+      const r = await $.process.run(['sh', '-c', 'nohup sh "$0" "$1" >/dev/null 2>&1 &', `${$.plugin.root}/sound/sea-sound.sh`, dir], { timeoutMs: 20000 })
+      return r.exitCode === 0
+    } catch {
+      return false
+    }
+  }
   const lit = (v: string) => `'"${v.replace(/'/g, "''")}"'`
   const script = `${$.plugin.root}/sound/sea-sound.ps1`
   const cmd =
@@ -149,7 +195,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'sea',
-      description: '入力欄の上の海を表示/非表示。/sea auto | morning | noon | dusk | night | dawn | crab | sound [0-100] | status',
+      description: '入力欄の上の海を表示/非表示。/sea help でコマンド一覧',
     })
     await $.ui.close({ id: PANE }) // 旧パネルの掃除
 
@@ -171,6 +217,7 @@ export const register: Register = on => {
     const sid = Math.floor(Math.random() * 1e9).toString(36)
     let ticks = 0
     let lastSpawn = 0
+    let quickRetries = 0 // 起動してもすぐ止まる状態が続いた回数
     const controlTick = async () => {
       lastControlAt = await $.clock.now()
       try {
@@ -184,10 +231,12 @@ export const register: Register = on => {
         const now = await $.clock.now()
         await $.fs.write(`${dir}/sessions/${sid}.txt`, String(now))
         if (ctl?.on !== false && !soundBroken && now - lastSpawn > SPAWN_COOLDOWN_MS && (await playerAgeMs($, dir, now)) > PLAYER_STALE_MS) {
+          // 起動してもすぐ止まる (音声の再生コマンドが無いなど) 状態が続いたら、あきらめて 1 回だけ知らせる
+          quickRetries = now - lastSpawn < 90000 ? quickRetries + 1 : 0
           lastSpawn = now
-          if (!(await launchPlayer($, dir))) {
+          if (quickRetries >= 3 || !(await launchPlayer($, dir))) {
             soundBroken = true
-            $.ui.toast('海: 波の音を再生できませんでした (Windows の PowerShell が必要です)。/sea sound on で再試行します')
+            $.ui.toast('海: 波の音を鳴らせませんでした。/sea status で理由を確認できます (Windows は PowerShell、macOS / Linux は sh と音声の再生コマンドが必要)。/sea sound on で再試行します')
           }
         }
       } catch {
@@ -220,6 +269,7 @@ export const register: Register = on => {
     if (dir === '') dir = await stateDirOf($)
     const BUSY = { text: '海: 制御ファイルを読めませんでした (ほかのセッションが書き込み中かもしれません)。もう一度実行してください。' }
 
+    if (arg === 'help' || arg === '?' || arg === '-h' || arg === '--help') return { text: HELP }
     if (arg === 'auto') {
       pinned = undefined
       if (!(await writeControl($, dir, { scene: -1 }))) return BUSY
@@ -241,12 +291,14 @@ export const register: Register = on => {
       const ctl = (await readControl($, dir)) ?? DEFAULT_CONTROL
       const age = await playerAgeMs($, dir, now)
       const sessions = await countSessions($, dir, now)
+      const tail = age >= PLAYER_STALE_MS ? await tailLog($, dir, 3) : ''
       const lines = [
         `表示: ${isOn ? 'ON' : 'OFF'} (このセッション) / 場面: ${ctl.scene >= 0 ? SCENES[ctl.scene].label : '自動で巡る'}`,
         `音: ${ctl.on ? 'ON' : 'OFF'} / 音量 ${ctl.volume} / ずれ補正 ${ctl.syncMs}ms`,
         `プレーヤー: ${age < PLAYER_STALE_MS ? `稼働中 (合図 ${(age / 1000).toFixed(1)} 秒前)` : '停止'}${soundBroken ? ' / 起動に失敗した印あり' : ''}`,
         `生きているセッション: ${sessions}`,
         `状態の置き場: ${dir}`,
+        ...(tail ? [`直近のプレーヤーのログ:\n${tail}`] : []),
       ]
       return { text: lines.join('\n') }
     }
@@ -280,7 +332,7 @@ export const register: Register = on => {
     }
     if (arg !== '') {
       return {
-        text: '海: /sea auto | morning | noon | dusk | night | dawn | crab | swept | turtle | fish | gull | meteor | boat | shell | sound [on | off | 0-100] | sync <ms> | status',
+        text: '海: 使い方が違います。/sea help でコマンド一覧を見られます。',
       }
     }
 
