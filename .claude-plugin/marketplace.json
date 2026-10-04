@@ -1,0 +1,17 @@
+{
+  "$schema": "https://www.schemastore.org/claude-code-marketplace.json",
+  "name": "claude-code-sea",
+  "description": "Claude Code の入力欄の上に、ドット絵の海を。",
+  "owner": {
+    "name": "himazintom",
+    "url": "https://github.com/himazintom"
+  },
+  "plugins": [
+    {
+      "name": "sea",
+      "description": "入力欄の上に、真上から見た浅瀬の波をドット絵で動かす。朝・夕焼け・夜が巡り、波の音と Claude くんつき。(非公式)",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

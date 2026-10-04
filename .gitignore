@@ -1,0 +1,11 @@
+# /plugin-types が書き出す型定義 (Anthropic のもの。再配布しない)
+.claude/types/
+.claude-plugin/types/
+tsconfig.json
+
+# 状態ファイル (実行時に ~/.claude/sea-state に作られるが、念のため)
+sea-state/
+*.log
+node_modules/
+.DS_Store
+Thumbs.db
