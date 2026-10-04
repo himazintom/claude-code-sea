@@ -1,0 +1,5 @@
+# macOS / Linux で実行する sh スクリプトは、どの OS で取得しても LF のままにする (CRLF だと sh が動かない)
+*.sh text eol=lf
+*.wav binary
+*.gif binary
+*.png binary
