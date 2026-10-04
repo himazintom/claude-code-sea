@@ -118,6 +118,11 @@ while :; do
   if [ -n "$(find "$SESS" -type f -mmin -1 2>/dev/null | head -n 1)" ]; then idle=0; else idle=$(( idle + 1 )); fi
   if [ "$idle" -ge 3 ]; then log "exit: no live session"; break; fi
   if [ "$idle" -gt 0 ]; then sleep 1; continue; fi
+  # every live session has hidden the sea (/sea): stay quiet, and start again at the right phase when one shows it again
+  if [ -z "$(find "$SESS" -type f -mmin -1 ! -exec grep -q hidden {} \; -print 2>/dev/null | head -n 1)" ]; then
+    if [ -n "$LOOP_PID" ]; then stop_play; sig=""; log "muted: every session hides the sea"; fi
+    sleep 1; continue
+  fi
 
   vol=$(field volume); sync=$(field syncMs)
   [ -n "$vol" ] || vol="${last_vol:-30}"; [ -n "$sync" ] || sync="${last_sync:-120}"

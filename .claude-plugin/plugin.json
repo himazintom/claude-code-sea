@@ -1,6 +1,6 @@
 {
   "name": "sea",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "入力欄の上に、真上から見た浅瀬の波をドット絵で動かす Claude Code のモッド。朝・夕焼け・夜が巡り、波の音 (Windows / macOS / Linux) と、ときどき Claude くんが遊びに来る。(非公式)",
   "author": {
     "name": "himazintom",

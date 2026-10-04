@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { Elements, EngineInterface, Register, Timer } from 'claude-code'
 
 import { actorsAt } from './actors'
 import type { ActorKind, ForcedActor } from './actors'
@@ -40,11 +40,30 @@ const NAMES: Record<string, number> = {
   dawn: 4,
 }
 
+const CONTROLS_MIN_COLS = 40 // 操作行を出す最小の幅
+const VOLUME_STEP = 10 // [-] [+] 1 回あたりの音量
+const GUIDE_VERSION = 1 // 案内を出し直したいときに上げる (導入後に 1 回だけ出す)
+const BUSY_PLAY_MS = 6000 // 止めていた音を ON にしたあと、プレーヤーが起動して鳴り始めるまで操作を受けない時間
+const BUSY_SCENE_MS = 3500 // 場面を切り替えたあと、プレーヤーが音を合成し直して入れ替えるまで
+const BUSY_STOP_MS = 2000 // 音を止めたあと、プレーヤーが終わるまで
+const DEDUPE_MS = 800 // 同じボタンの focus と press が続けて届いても、1 回しか実行しない
+
+// 導入後に 1 回出す案内。[?] ボタンでいつでも出せる
+const GUIDE = [
+  '🌊 海 (sea): 入力欄の上に海が出ています',
+  '  入力欄の上の操作行: [音 ON] 音の切り替え / [-] [+] 音量 / [場面] 朝→昼→夕焼け→夜→明け方→自動 / [?] この案内',
+  '  コマンド: /sea help (一覧) /sea (このセッションの表示を隠す・出す) /sea sound off (音を止める)',
+].join('\n')
+
 // /sea help の本文
 const HELP = [
-  '海 (sea) のコマンド',
+  '海 (sea) の操作',
   '',
-  '  /sea                 このセッションの表示を切り替える (音は止まりません)',
+  '入力欄の上の操作行 (クリック)',
+  '  [音 ON] 音の ON/OFF   [-] [+] 音量   [場面:...] 場面を順に切り替え   [?] 案内を出す',
+  '',
+  'コマンド',
+  '  /sea                 このセッションの海を隠す/出す (全セッションで隠すと音も止まる)',
   '  /sea status          表示・音・プレーヤー・セッション数・直近のログを見る',
   '  /sea help            この一覧',
   '',
@@ -132,13 +151,32 @@ async function playerAgeMs($: EngineInterface, dir: string, now: number): Promis
   }
 }
 
-async function countSessions($: EngineInterface, dir: string, now: number): Promise<number> {
+// 生きているセッションの数と、そのうち海を表示しているセッションの数。
+// 各セッションは合図のファイルに、海を隠しているあいだ "hidden" と書く (音のプレーヤーが読む)
+async function countSessions($: EngineInterface, dir: string, now: number): Promise<{ alive: number; shown: number }> {
+  let alive = 0
+  let shown = 0
   try {
     const entries = await $.fs.list(`${dir}/sessions`)
-    return entries.filter(f => f.kind === 'file' && now - f.mtimeMs < SESSION_FRESH_MS).length
+    for (const f of entries) {
+      if (f.kind !== 'file' || now - f.mtimeMs >= SESSION_FRESH_MS) continue
+      alive += 1
+      try {
+        if (!String(await $.fs.read(`${dir}/sessions/${f.name}`)).includes('hidden')) shown += 1
+      } catch {
+        shown += 1
+      }
+    }
   } catch {
-    return 0
+    // 数えられなければ 0
   }
+  return { alive, shown }
+}
+
+// このセッションの生きている合図。海を隠しているあいだは "hidden" を添える。
+// 全セッションが隠しているときだけ、音のプレーヤーは音を止める
+async function writeBeat($: EngineInterface, dir: string, sid: string, now: number, hidden: boolean) {
+  await $.fs.write(`${dir}/sessions/${sid}.txt`, hidden ? `${now} hidden` : String(now))
 }
 
 // プレーヤーが書いたログの末尾 (音が鳴らないときの手がかり)
@@ -179,8 +217,96 @@ async function launchPlayer($: EngineInterface, dir: string): Promise<boolean> {
   }
 }
 
+// ---- 画面上の操作行 ----
+// ボタンの押下は ui.press フックで受ける (onPress 自体は何もしない)
+function noop() {}
+
+type ControlKind = 'sound' | 'vol-' | 'vol+' | 'scene'
+const CONTROL_KEYS: Record<string, ControlKind | 'help'> = {
+  'sea-sound': 'sound',
+  'sea-vol-down': 'vol-',
+  'sea-vol-up': 'vol+',
+  'sea-scene': 'scene',
+  'sea-help': 'help',
+}
+
+// ボタンに応じて制御ファイルを書き換える。読めなければ undefined (書かない)
+async function pressControl($: EngineInterface, dir: string, kind: ControlKind): Promise<Control | undefined> {
+  const cur = (await readControl($, dir)) ?? DEFAULT_CONTROL
+  if (kind === 'sound') return writeControl($, dir, { on: !cur.on })
+  if (kind === 'vol-') return writeControl($, dir, { volume: Math.max(VOLUME_STEP, cur.volume - VOLUME_STEP) })
+  if (kind === 'vol+') return writeControl($, dir, { on: true, volume: Math.min(100, cur.volume + VOLUME_STEP) })
+  // 場面: 自動 → 朝 → 昼 → 夕焼け → 夜 → 明け方 → 自動
+  return writeControl($, dir, { scene: cur.scene >= SCENES.length - 1 ? -1 : cur.scene + 1 })
+}
+
+// 操作の受付状態。音のプレーヤーが作り直されるあいだ (準備中) は、操作を受け付けない
+type ControlGate = { busyUntil: number; lastEl: string; lastAt: number }
+
+// クリックは ui.focus (ring が移る) → ui.press の順に届くが、再描画でボタンが作り直されると押下が空振りする。
+// そこで ui.focus の時点で操作を実行し、focus は拒否する (ring も再描画も起きず、入力欄のキーも奪わない)。
+// 後から押下が届いても二重に実行しないよう、同じボタンの操作は短時間つぶす
+async function actOnControl($: EngineInterface, dir: string, element: string, gate: ControlGate): Promise<Control | undefined> {
+  const kind = CONTROL_KEYS[element]
+  if (!kind) return undefined
+  const now = await $.clock.now()
+  if (gate.lastEl === element && now - gate.lastAt < DEDUPE_MS) return undefined
+  gate.lastEl = element
+  gate.lastAt = now
+  if (kind === 'help') {
+    $.ui.log(GUIDE, { to: 'transcript' })
+    return undefined
+  }
+  if (now < gate.busyUntil) return undefined // 準備中
+  const before = await readControl($, dir)
+  const ctl = await pressControl($, dir, kind)
+  if (!ctl) {
+    $.ui.toast('海: 制御ファイルを読めませんでした (ほかのセッションが書き込み中かもしれません)。もう一度押してください')
+    return undefined
+  }
+  // 受け付けない時間: 止めたあとはプレーヤーが終わるまで / 止まっていた音を鳴らすならプレーヤーの起動まで /
+  // 場面の切り替えは音の合成し直しのあいだ。音量だけの変更は掛け直すだけなので待たない
+  if (!ctl.on) gate.busyUntil = kind === 'sound' ? now + BUSY_STOP_MS : 0
+  else if (before && !before.on) gate.busyUntil = now + BUSY_PLAY_MS
+  else gate.busyUntil = kind === 'scene' ? now + BUSY_SCENE_MS : 0
+  $.ui.invalidate('ui.render')
+  return ctl
+}
+
+type Els = Pick<Elements['terminal'], 'Box' | 'Text' | 'Button'>
+
+// 音と場面の操作行。端末もデスクトップも同じ木 (デスクトップはネイティブのボタンで描かれる)。
+// 準備中は押せるボタンを出さず、文字だけにする。終わると新しいボタンが出る
+function controlRow(El: Els, soundOn: boolean, volume: number, scene: number, busy: boolean) {
+  const { Box, Text, Button } = El
+  const sceneName = scene >= 0 ? SCENES[scene].label.replace('の海', '') : '自動'
+  if (busy) {
+    return (
+      <Box flexDirection="row" gap={1}>
+        <Text bold>{soundOn ? '音 準備中…' : '音 停止中…'}</Text>
+        <Text bold>{`音量 ${volume}`}</Text>
+        <Text bold>{`場面:${sceneName}`}</Text>
+      </Box>
+    )
+  }
+  return (
+    <Box flexDirection="row" gap={1}>
+      <Button key="sea-sound" plain label={soundOn ? '[音 ON]' : '[音 OFF]'} onPress={noop} />
+      <Button key="sea-vol-down" plain label="[-]" onPress={noop} />
+      <Text bold>{`音量 ${volume}`}</Text>
+      <Button key="sea-vol-up" plain label="[+]" onPress={noop} />
+      <Button key="sea-scene" plain label={`[場面:${sceneName}]`} onPress={noop} />
+      <Button key="sea-help" plain label="[?]" onPress={noop} />
+    </Box>
+  )
+}
+
 export const register: Register = on => {
   let dir = '' // 状態の置き場 (session.start で決まる)
+  let sid = '' // このセッションの印 (合図のファイル名)
+  const gate: ControlGate = { busyUntil: 0, lastEl: '', lastAt: 0 } // 操作行の受付状態
+  let soundOn = true // 制御ファイルの音 ON/OFF (操作行の表示用)
+  let volume = DEFAULT_CONTROL.volume // 同・音量
   let isOn = true // /sea で切り替える (セッションごと)
   let rows = ROWS // 直近に描いた高さ
   let label = ''
@@ -212,9 +338,20 @@ export const register: Register = on => {
       })
     }
 
+    // 導入後の最初のセッションで 1 回だけ、操作方法の案内を出す (GUIDE_VERSION を上げると出し直す)
+    try {
+      if (Number((await $.store.get('guide')) ?? 0) < GUIDE_VERSION) {
+        await $.store.set('guide', GUIDE_VERSION)
+        $.ui.log(GUIDE, { to: 'transcript' })
+        $.ui.toast('海: 入力欄の上のボタンで音量・場面を操作できます。[?] で案内、/sea help で一覧', { timeoutMs: 10000 })
+      }
+    } catch {
+      // 案内が出せなくても海は動かす
+    }
+
     // 制御ファイルを 1 秒おきに見て、場面・動くものを全セッションで揃える。
     // 5 秒おきに「このセッションは生きている」の合図を書き、プレーヤーがいなければ起動する
-    const sid = Math.floor(Math.random() * 1e9).toString(36)
+    sid = Math.floor(Math.random() * 1e9).toString(36)
     let ticks = 0
     let lastSpawn = 0
     let quickRetries = 0 // 起動してもすぐ止まる状態が続いた回数
@@ -225,11 +362,13 @@ export const register: Register = on => {
         if (ctl) {
           pinned = ctl.scene >= 0 ? ctl.scene : undefined
           forced = ctl.forced ?? undefined
+          soundOn = ctl.on
+          volume = ctl.volume
         }
         ticks += 1
         if (ticks % BEAT_EVERY !== 1) return
         const now = await $.clock.now()
-        await $.fs.write(`${dir}/sessions/${sid}.txt`, String(now))
+        await writeBeat($, dir, sid, now, !isOn)
         if (ctl?.on !== false && !soundBroken && now - lastSpawn > SPAWN_COOLDOWN_MS && (await playerAgeMs($, dir, now)) > PLAYER_STALE_MS) {
           // 起動してもすぐ止まる (音声の再生コマンドが無いなど) 状態が続いたら、あきらめて 1 回だけ知らせる
           quickRetries = now - lastSpawn < 90000 ? quickRetries + 1 : 0
@@ -291,12 +430,13 @@ export const register: Register = on => {
       const ctl = (await readControl($, dir)) ?? DEFAULT_CONTROL
       const age = await playerAgeMs($, dir, now)
       const sessions = await countSessions($, dir, now)
+      const muted = ctl.on && sessions.alive > 0 && sessions.shown === 0
       const tail = age >= PLAYER_STALE_MS ? await tailLog($, dir, 3) : ''
       const lines = [
         `表示: ${isOn ? 'ON' : 'OFF'} (このセッション) / 場面: ${ctl.scene >= 0 ? SCENES[ctl.scene].label : '自動で巡る'}`,
         `音: ${ctl.on ? 'ON' : 'OFF'} / 音量 ${ctl.volume} / ずれ補正 ${ctl.syncMs}ms`,
         `プレーヤー: ${age < PLAYER_STALE_MS ? `稼働中 (合図 ${(age / 1000).toFixed(1)} 秒前)` : '停止'}${soundBroken ? ' / 起動に失敗した印あり' : ''}`,
-        `生きているセッション: ${sessions}`,
+        `生きているセッション: ${sessions.alive} (うち海を表示中: ${sessions.shown})${muted ? ' / 全セッションで隠しているため、音は一時停止中' : ''}`,
         `状態の置き場: ${dir}`,
         ...(tail ? [`直近のプレーヤーのログ:\n${tail}`] : []),
       ]
@@ -340,25 +480,63 @@ export const register: Register = on => {
     isOn = !isOn
     $.ui.invalidate('ui.render')
     if (!isOn) $.ui.status(undefined)
-    return { text: isOn ? '海を表示します。' : '海を隠しました (このセッションだけ)。/sea でまた見られます。' }
+    if (sid) {
+      try {
+        await writeBeat($, dir, sid, await $.clock.now(), !isOn) // すぐ知らせる (全セッションが隠したら音が止まる)
+      } catch {
+        // 次の周期の合図で伝わる
+      }
+    }
+    return {
+      text: isOn
+        ? '海を表示します。'
+        : '海を隠しました (このセッションだけ)。開いているすべてのセッションで隠すと、波の音も止まります。/sea でまた見られます。',
+    }
   })
 
-  // 海は表示専用。クリックされても入力欄からキーを奪わない (奪われると、Esc を押すまで入力できず固まって見える)
-  on('ui.focus', { component: 'AbovePrompt' }, ($, e, next) => {
-    if (isOn && e.element === undefined) return { deny: '海は表示専用です' }
+  // 操作の結果を、このセッションの表示用の状態に取り込む
+  const takeControl = (ctl: Control | undefined) => {
+    if (!ctl) return
+    if (ctl.on) soundBroken = false // 付け直したら、起動の失敗の印を消して再試行する
+    pinned = ctl.scene >= 0 ? ctl.scene : undefined
+    soundOn = ctl.on
+    volume = ctl.volume
+  }
+
+  // 海は表示専用。クリックされても入力欄からキーを奪わない (奪われると、Esc を押すまで入力できず固まって見える)。
+  // 操作行のボタンはクリックが ui.focus として届くので、ここで操作を実行してから focus を拒否する
+  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!isOn) return next(e)
+    if (e.element !== undefined && e.element in CONTROL_KEYS) {
+      if (dir === '') dir = await stateDirOf($)
+      takeControl(await actOnControl($, dir, e.element, gate))
+      return { deny: '海は表示専用です' }
+    }
+    if (e.element === undefined) return { deny: '海は表示専用です' }
     return next(e)
+  })
+
+  // 操作行のボタン (Enter やホットキーなど、focus を経ない押下)。音の ON/OFF・音量・場面は制御ファイルに書く
+  on('ui.press', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!(e.element in CONTROL_KEYS)) return next(e)
+    if (dir === '') dir = await stateDirOf($)
+    takeControl(await actOnControl($, dir, e.element, gate))
+    return { element: e.element }
   })
 
   // 入力欄の真上のバンド
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!isOn || e.props.hasSurvey || e.props.maxRows < 4) return next(e)
 
-    rows = Math.min(ROWS, e.props.maxRows)
+    // 操作行 (1 行) を絵の下に付ける。高さか幅が足りなければ絵だけ
+    const showControls = e.props.maxRows >= 5 && e.props.bodyColumns >= CONTROLS_MIN_COLS
+    rows = Math.min(ROWS, e.props.maxRows - (showControls ? 1 : 0))
     const now = await $.clock.now()
     if (now - lastFrameAt > FRAME_STALE_MS || now - lastControlAt > CONTROL_STALE_MS) restartTimers?.() // 止まっていたら張り直す
 
     if (e.surface === 'terminal') {
-      const { Raster } = $.ui.resolve(e)
+      const el = $.ui.resolve(e)
+      const { Raster, Box } = el
       const cols = Math.max(8, Math.min(512, e.props.bodyColumns))
       const paint = paintSea(Math.max(1, cols >> 1), rows, now, pinned)
       const cells = toCells(paint, cols, actorsAt(now, cols, rows, pinned, forced))
@@ -367,11 +545,18 @@ export const register: Register = on => {
         $.ui.status(`🌊 ${label}`)
       }
 
-      return <Raster key={KEY} columns={cols} rows={rows} cells={cells} />
+      if (!showControls) return <Raster key={KEY} columns={cols} rows={rows} cells={cells} />
+      return (
+        <Box flexDirection="column">
+          <Raster key={KEY} columns={cols} rows={rows} cells={cells} />
+          {controlRow(el, soundOn, volume, pinned ?? -1, now < gate.busyUntil)}
+        </Box>
+      )
     }
 
     // デスクトップ: Raster が無いので Svg で描く
-    const { Svg } = $.ui.resolve(e)
+    const el = $.ui.resolve(e)
+    const { Svg, Box } = el
     const paint = paintSea(DESKTOP_DOTS, rows, now, pinned)
     const actors = actorsAt(now, DESKTOP_DOTS * 2, rows, pinned, forced)
     if (paint.label !== label) {
@@ -379,6 +564,13 @@ export const register: Register = on => {
       $.ui.status(`🌊 ${label}`)
     }
 
-    return <Svg source={toSvg(paint, DESKTOP_DOT_PX, actors)} alt={`海 (${paint.label})`} />
+    const svg = <Svg source={toSvg(paint, DESKTOP_DOT_PX, actors)} alt={`海 (${paint.label})`} />
+    if (!showControls) return svg
+    return (
+      <Box flexDirection="column">
+        {svg}
+        {controlRow(el, soundOn, volume, pinned ?? -1, now < gate.busyUntil)}
+      </Box>
+    )
   })
 }

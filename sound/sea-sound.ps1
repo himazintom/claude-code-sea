@@ -122,6 +122,37 @@ public static class SeaSynth
         return o;
     }
 
+    // Copies a WAV starting shiftFrames frames in (circularly) and scales every sample by toVol / fromVol.
+    // Changing the volume then needs no new synthesis: the loop is built once at a fixed reference volume.
+    public static byte[] Rescale(byte[] wav, double fromVol, double toVol, int shiftFrames)
+    {
+        int frames = (wav.Length - 44) / 4;
+        if (frames <= 0) return wav;
+        int sh = (int)((((long)shiftFrames % frames) + frames) % frames);
+        byte[] o = new byte[wav.Length];
+        Buffer.BlockCopy(wav, 0, o, 0, 44);
+        double k = toVol / fromVol;
+        int src = 44 + sh * 4;
+        int end = 44 + frames * 4;
+        int dst = 44;
+        for (int i = 0; i < frames; i++)
+        {
+            for (int c = 0; c < 2; c++)
+            {
+                int s = (short)(wav[src] | (wav[src + 1] << 8));
+                int v = (int)Math.Round(s * k);
+                if (v > 32767) v = 32767;
+                if (v < -32768) v = -32768;
+                o[dst] = (byte)(v & 255);
+                o[dst + 1] = (byte)((v >> 8) & 255);
+                src += 2;
+                dst += 2;
+            }
+            if (src >= end) src = 44;
+        }
+        return o;
+    }
+
     // flat: groups of 4 = t, amp, rush, drain (seconds, within WaveLoop). tide: one value per 0.5 s over WaveLoop.
     // sp: 5 scenes x 5 parameters. scene: -1 follows the scene cycle. startPhase: where in the loop sample 0 sits.
     // The volume always refers to the loudest moment of the WHOLE scene cycle, so a quiet scene (night) stays
@@ -256,7 +287,8 @@ function New-Sea([double]$vol, [int]$sync, [int]$scene, [int64]$startMs) {
   $loopMs = [int64]($loopSec * 1000)
   $u0 = (($startMs - $sync) % $loopMs) / 1000.0
   if ($DryRun -ne "") { $u0 = 0.0 }
-  return [SeaSynth]::Make(16000, $vol, $scene, $u0, $flatArr, $tideArr, $sp)
+  # the leading comma keeps the byte[] in one piece: a plain return would unroll 30 MB into 30 million boxed bytes (1.4 GB)
+  return ,([SeaSynth]::Make(16000, $vol, $scene, $u0, $flatArr, $tideArr, $sp))
 }
 
 try { Read-Schedule } catch { if ($DryRun -eq "") { try { [System.IO.File]::AppendAllText((Join-Path $StateDir 'player.log'), ('schedule error: ' + $_.Exception.Message + [Environment]::NewLine)) } catch { } }; throw }
@@ -292,62 +324,129 @@ function Read-Control {
   }
   return $null
 }
-function Test-SessionAlive {
+# 'none' = no live session, 'hidden' = live sessions exist but every one has hidden the sea (/sea), 'shown' = at least one shows it.
+# A session writes the word "hidden" into its heartbeat file while its sea is hidden.
+function Get-SessionState {
   $cut = (Get-Date).AddSeconds(-30)
-  $any = Get-ChildItem -Path $sessionsDir -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $cut } | Select-Object -First 1
-  return ($null -ne $any)
+  $alive = 0
+  $shown = 0
+  foreach ($f in (Get-ChildItem -Path $sessionsDir -File -ErrorAction SilentlyContinue)) {
+    if ($f.LastWriteTime -gt $cut) {
+      $alive++
+      $t = ''
+      try { $t = [System.IO.File]::ReadAllText($f.FullName) } catch { }
+      if ($t -notmatch 'hidden') { $shown++ }
+    }
+  }
+  if ($alive -eq 0) { return 'none' }
+  if ($shown -eq 0) { return 'hidden' }
+  return 'shown'
 }
 
 Write-Log 'start'
+# The loop is synthesized ONCE per scene/sync/schedule, at this reference volume. The real volume is applied by scaling
+# the samples (Rescale), so a volume change needs no new synthesis and takes effect almost at once.
+$RefVol = 0.9
 $lastCtl = $null
+$ctlStamp = [int64]0
 $player = $null
 $stream = $null
-$sig = ""
+$structSig = ""        # scene | sync | schedule: a change needs a new synthesis
+$baseBytes = $null     # the synthesized loop at $RefVol
+$baseStartMs = [int64]0  # the moment (ms) sample 0 of $baseBytes plays, as if the loop had run since then
+$playVol = -1.0        # the volume the player is playing now
+$marginMs = 3000       # how far ahead to plan the start of a new synthesis; follows how long the last one took
 $idle = 0
-$loops = 0
+$sessState = 'shown'
+$slowN = 0
+$tickN = 0
+
+# Starts $bytes looping at $startAt (ms) and only then stops the old one, so there is no silence while a new loop is prepared.
+function Start-Wav([byte[]]$bytes, [int64]$startAt) {
+  $newStream = New-Object System.IO.MemoryStream(, $bytes)
+  $newPlayer = New-Object System.Media.SoundPlayer($newStream)
+  $newPlayer.Load()
+  $wait = $startAt - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+  if ($null -ne $script:player) { $script:player.Stop(); $script:player.Dispose() }
+  $newPlayer.PlayLooping()
+  $script:player = $newPlayer
+  $script:stream = $newStream
+}
+
+# the control file is read about 3 times a second (a volume change is heard at once);
+# the heartbeat, session check and housekeeping run about once a second
 while ($true) {
-  $loops++
-  Write-Alive
-  $ctl = Read-Control
+  $tickN++
+  $slow = (($tickN % 3) -eq 1)
+  if ($slow) { Write-Alive }
+  # parse control.json only when the file changed (and once a second as a safety net): about 3 checks a second stay cheap
+  $st = [System.IO.File]::GetLastWriteTimeUtc($controlFile).Ticks
+  if ($slow -or $st -ne $ctlStamp -or $null -eq $lastCtl) {
+    $ctl = Read-Control
+    if ($null -ne $ctl) { $ctlStamp = $st }
+  } else { $ctl = $lastCtl }
   if ($null -ne $ctl) { $lastCtl = $ctl } else { $ctl = $lastCtl }   # unreadable: keep the last good control, never fall back to loud defaults
   if ($null -ne $ctl -and $ctl.on -eq $false) { Write-Log 'exit: turned off'; break }       # turned off from any session
-  if ((Get-Item $scriptPath).LastWriteTimeUtc.Ticks -ne $scriptStamp) { Write-Log 'exit: script updated'; break }   # updated: a fresh player takes over
-  if (Test-SessionAlive) { $idle = 0 } else { $idle++ }
-  if ($idle -ge 3) { Write-Log 'exit: no live session'; break }  # every session is closed
-  if ($idle -gt 0) { Start-Sleep -Seconds 1; continue }        # no session yet: do not start playing
-  if (($loops % 60) -eq 0) {                                   # tidy up heartbeat files of sessions long gone
-    Get-ChildItem -Path $sessionsDir -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } | Remove-Item -Force -ErrorAction SilentlyContinue
+  if ($slow) {
+    if ((Get-Item $scriptPath).LastWriteTimeUtc.Ticks -ne $scriptStamp) { Write-Log 'exit: script updated'; break }   # updated: a fresh player takes over
+    $sessState = Get-SessionState
+    if ($sessState -eq 'none') { $idle++ } else { $idle = 0 }
+    if ($idle -ge 3) { Write-Log 'exit: no live session'; break }  # every session is closed
+    $slowN++
+    if ($idle -eq 0 -and ($slowN % 60) -eq 0) {                   # tidy up heartbeat files of sessions long gone
+      Get-ChildItem -Path $sessionsDir -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+  }
+  if ($idle -gt 0) { Start-Sleep -Milliseconds 330; continue }   # no session yet: do not start playing
+  if ($sessState -eq 'hidden') {
+    # every session hides the sea: stay quiet; when one shows it again, playback resumes at the right phase
+    if ($null -ne $player) {
+      $player.Stop(); $player.Dispose(); $player = $null
+      $playVol = -1.0
+      Write-Log 'muted: every session hides the sea'
+    }
+    Start-Sleep -Milliseconds 330; continue
   }
 
   $vol = $Volume
   $sync = $SyncMs
   $scn = $Scene
   if ($null -ne $ctl) { $vol = [double]$ctl.volume / 100.0; $sync = [int]$ctl.syncMs; $scn = [int]$ctl.scene }
-  $schedStamp = (Get-Item $schedPath).LastWriteTimeUtc.Ticks
-  $newSig = "$vol|$sync|$scn|$schedStamp"
-  if ($newSig -ne $sig) {
-    # volume / scene / sync / schedule changed (from any session): rebuild and restart on the right beat
-    Write-Log ('build ' + $newSig)
-    if ($null -ne $player) { $player.Stop(); $player.Dispose(); $player = $null }
+  $schedStamp = [System.IO.File]::GetLastWriteTimeUtc($schedPath).Ticks
+  $newStruct = "$sync|$scn|$schedStamp"
+  if ($newStruct -ne $structSig -or $null -eq $baseBytes) {
+    # scene / sync / schedule changed (from any session), or the first start: synthesize and start on the right beat
+    Write-Log ('build ' + "$vol|$newStruct")
     Read-Schedule
-    $plannedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 4000
-    $bytes = New-Sea $vol $sync $scn $plannedMs
-    $lateMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 400 - $plannedMs
-    if ($lateMs -gt 0) {
-      # generation took longer than planned (a busy machine): start now, at the phase we have reached
-      $bytes = [SeaSynth]::Rotate($bytes, [int]($lateMs * 16))
-      Write-Log ('late by ' + $lateMs + ' ms, rotated')
-    }
-    $stream = New-Object System.IO.MemoryStream(, $bytes)
-    $player = New-Object System.Media.SoundPlayer($stream)
-    $player.Load()
-    $wait = $plannedMs - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
-    $player.PlayLooping()
-    $sig = $newSig
+    $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $plannedMs = $t0 + $marginMs
+    $baseBytes = New-Sea $RefVol $sync $scn $plannedMs
+    $baseStartMs = $plannedMs
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $marginMs = [Math]::Min(6000, [Math]::Max(1500, [int](($nowMs - $t0) * 1.6 + 600)))
+    # if synthesis took longer than planned (a busy machine) start a little later, at the phase we have reached
+    $startAt = [Math]::Max($plannedMs, $nowMs + 600)
+    $shift = [int](($startAt - $plannedMs) * 16)
+    if ($shift -gt 0) { Write-Log ('late by ' + ($startAt - $plannedMs) + ' ms, rotated') }
+    $bytes = [SeaSynth]::Rescale($baseBytes, $RefVol, $vol, $shift)
+    Start-Wav $bytes $startAt
+    $structSig = $newStruct
+    $playVol = $vol
     Write-Alive
     Write-Log 'playing'
   }
-  Start-Sleep -Seconds 1
+  elseif ($vol -ne $playVol) {
+    # only the volume changed: no synthesis, just scale the loop and continue at the phase we are at
+    Write-Log ('volume ' + $playVol + ' -> ' + $vol)
+    $startAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 250
+    $frames = [int64](($baseBytes.Length - 44) / 4)
+    $shift = [int]((([int64](($startAt - $baseStartMs) * 16)) % $frames + $frames) % $frames)
+    $bytes = [SeaSynth]::Rescale($baseBytes, $RefVol, $vol, $shift)
+    Start-Wav $bytes $startAt
+    $playVol = $vol
+    Write-Log 'playing'
+  }
+  Start-Sleep -Milliseconds 330
 }
 if ($null -ne $player) { $player.Stop() }
